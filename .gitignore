@@ -1,22 +1,464 @@
 ### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
-.vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-file
-*.flf
-#Test results file
-TestResults.xml
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+WOS自动化下载器 - 基于 basic-search + Alt+Left 返回的稳定版
+使用前请确认：
+1）只用于个人小规模下载，遵守 Web of Science 许可协议；
+2）Edge 已登陆 WOS，basic-search 页面已打开并最大化。
+"""
+
+import time
+import logging
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+import pyautogui
+import pyperclip
+import re
+
+# ----------------- 日志配置 -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('wos_pyautogui_downloader.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ----------------- PyAutoGUI 全局配置 -----------------
+pyautogui.FAILSAFE = True      # 鼠标移到左上角立刻终止
+pyautogui.PAUSE = 0.5          # 每个动作之间默认停顿 0.5s
+
+
+class WOSPyAutoGUIDownloader:
+    """基于 Excel 标题的 WOS 文献自动下载器（Tab delimited + Full Record and Cited References）"""
+
+    def __init__(self, excel_path: str):
+        self.excel_path = Path(excel_path)
+        self.script_dir = Path(__file__).parent.absolute()
+        self.titles = []          # [{'sheet':..., 'row_id':..., 'title':..., 'journal':..., 'year':...}, ...]
+        self.no_result_log = []   # 无结果记录
+        self.search_box_pos = None
+        self.checkbox_pos = None
+        self.export_pos = None
+        self.record_content_pos = None    # Record Content 下拉框位置
+        self.export_confirm_pos = None    # Export 确认按钮位置
+        self.url_bar_pos = None           # 浏览器地址栏位置
+
+        self.load_titles()
+
+    # ---------- 读 Excel 标题 ----------
+    def load_titles(self):
+        """从所有 sheet 的 B 列读取标题（从第 2 行开始），并记录 sheet / 行号"""
+        try:
+            logger.info(f"正在读取 Excel 文件：{self.excel_path}")
+            excel_file = pd.ExcelFile(self.excel_path)
+
+            for sheet_name in excel_file.sheet_names:
+                df = pd.read_excel(self.excel_path, sheet_name=sheet_name)
+                if df.shape[1] < 2:
+                    continue
+
+                count_in_sheet = 0
+                for idx in range(0, len(df)):  # 从第 1 行(pandas索引0)开始,对应Excel第2行
+                    title = df.iloc[idx, 1]  # B 列
+                    journal = df.iloc[idx, 2] if df.shape[1] > 2 and pd.notna(df.iloc[idx, 2]) else ""
+                    year = df.iloc[idx, 3] if df.shape[1] > 3 and pd.notna(df.iloc[idx, 3]) else ""
+
+                    if pd.notna(title):
+                        self.titles.append({
+                            "sheet": sheet_name,
+                            "row_id": idx + 2,  # Excel行号 = pandas索引 + 2(因为有标题行)
+                            "title": str(title).strip(),
+                            "journal": str(journal).strip(),
+                            "year": str(year).strip()
+                        })
+                        count_in_sheet += 1
+
+                logger.info(f"Sheet '{sheet_name}' 中读取到 {count_in_sheet} 条标题")
+
+            logger.info(f"总共加载 {len(self.titles)} 个标题")
+
+        except Exception as e:
+            logger.error(f"读取 Excel 失败：{e}")
+            raise
+
+    # ---------- 辅助函数 ----------
+    @staticmethod
+    def _record_mouse_position(msg: str) -> tuple:
+        """倒计时后记录当前鼠标位置"""
+        logger.info("=" * 60)
+        logger.info(msg)
+        logger.info("请把鼠标移动到指定位置上方，不要点击，保持不动。")
+        for i in range(3, 0, -1):
+            logger.info(f"{i} ...")
+            time.sleep(1)
+        pos = pyautogui.position()
+        logger.info(f"✓ 记录坐标：X={pos[0]}, Y={pos[1]}")
+        time.sleep(1)
+        return pos
+
+    def _check_no_results(self) -> bool:
+        """检测是否出现'Your search found no results'提示 - 通过URL判断"""
+        try:
+            if self.url_bar_pos:
+                logger.info("检查浏览器URL判断是否有搜索结果...")
+                # 点击地址栏
+                pyautogui.click(self.url_bar_pos[0], self.url_bar_pos[1])
+                time.sleep(0.3)
+                # 全选地址栏内容
+                pyautogui.hotkey("ctrl", "a")
+                time.sleep(0.2)
+                # 复制URL
+                pyautogui.hotkey("ctrl", "c")
+                time.sleep(0.3)
+                # 获取剪贴板内容
+                current_url = pyperclip.paste()
+                logger.info(f"当前URL: {current_url}")
+                
+                # 按ESC取消地址栏选中状态
+                pyautogui.press("esc")
+                time.sleep(0.2)
+                
+                # 如果URL还是 basic-search，说明没有跳转到结果页，即无搜索结果
+                if "basic-search" in current_url.lower():
+                    logger.info("URL检测：页面未跳转，判断为无搜索结果")
+                    return True
+                else:
+                    logger.info("URL检测：页面已跳转到结果页，有搜索结果")
+                    return False
+            
+            return False
+        except Exception as e:
+            logger.warning(f"检测无结果时出错：{e}，默认假设有结果")
+            return False
+
+    def log_no_result(self, title_info: dict):
+        """简单记录无结果的题目（这里无法自动检测，只是接口预留）"""
+        sheet = title_info["sheet"]
+        row_id = title_info["row_id"]
+        title = title_info["title"]
+
+        log_entry = f"{sheet} + {row_id} + {title}"
+        self.no_result_log.append(log_entry)
+        logger.warning(f"无结果记录（需要人工核查）：{log_entry}")
+
+        log_file = self.script_dir / "no_results.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {log_entry}\n")
+
+    # ---------- 单个标题的处理逻辑 ----------
+    def process_one_title(self, title_info: dict, is_first: bool = False) -> bool:
+        """
+        对应步骤：
+        1/8/9：在 basic-search 页搜索标题；
+        2：结果页勾选复选框；
+        3：Export -> Tab delimited file；
+        4/5：Record Content 选 Full Record and Cited References；
+        6：点击 Export，等待下载；
+        之后 Alt+Left 回到 basic-search。
+        """
+        try:
+            title = title_info["title"]
+            sheet = title_info["sheet"]
+            row_id = title_info["row_id"]
+
+            logger.info("")
+            logger.info("-" * 60)
+            logger.info(f"开始处理 [{sheet}][行 {row_id}]：{title}")
+
+            # === 一、在 basic-search 页面执行检索 ===
+            if not self.search_box_pos:
+                logger.error("搜索框坐标未记录！")
+                return False
+
+            # 对于第一个标题，如果你已经手动搜索过，也可以设 is_first=True 跳过这段
+            logger.info("在 basic-search 页面输入标题并执行搜索...")
+            pyautogui.click(self.search_box_pos[0], self.search_box_pos[1])
+            time.sleep(0.5)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.2)
+            pyautogui.press("delete")
+            time.sleep(0.2)
+
+            pyperclip.copy(title)
+            time.sleep(0.2)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.8)
+            pyautogui.press("enter")
+            logger.info("已提交搜索，等待结果页加载...")
+            time.sleep(6)  # 如果网速较慢可适当加大
+
+            # === 二、在结果页勾选复选框 ===
+            if not self.checkbox_pos:
+                logger.error("复选框坐标未记录！")
+                return False
+
+            logger.info("勾选第一个结果的复选框（对应截图 2 中的 1）...")
+            pyautogui.click(self.checkbox_pos[0], self.checkbox_pos[1])
+            time.sleep(0.8)
+
+            # === 三、点击 Export -> Tab delimited file ===
+            if not self.export_pos:
+                logger.error("Export 按钮坐标未记录！")
+                return False
+
+            logger.info(f"点击 Export 按钮（记录坐标 {self.export_pos[0]}, {self.export_pos[1]}）...")
+            pyautogui.click(self.export_pos[0], self.export_pos[1])
+            time.sleep(2)
+
+            logger.info("在 Export 下拉菜单中选择 Tab delimited file（对应截图 3 中的 3）...")
+            # 菜单默认在第一项，从上往下依次是 EndNote desktop, Add to my researcher profile, ...
+            # Tab delimited file 大约是第 8 项，向下 7 次
+            for _ in range(7):
+                pyautogui.press("down")
+                time.sleep(0.15)
+            pyautogui.press("enter")
+            time.sleep(3)
+
+            # === 四、弹窗中选择 Record Content ===
+            logger.info("配置 Export 弹窗（对应截图 4、5）...")
+            if not self.record_content_pos:
+                logger.error("Record Content 下拉框坐标未记录！")
+                return False
+            logger.info(f"点击 Record Content 下拉框：{self.record_content_pos}")
+            pyautogui.click(self.record_content_pos[0], self.record_content_pos[1])
+            time.sleep(0.8)
+
+            # 使用键盘自动选择第4个选项:Full Record and Cited References
+            logger.info("自动选择 Full Record and Cited References...")
+            for _ in range(3):
+                pyautogui.press("down")
+                time.sleep(0.2)
+            pyautogui.press("enter")
+            time.sleep(0.8)
+
+            # === 五、点击弹窗 Export 按钮 ===
+            if not self.export_confirm_pos:
+                logger.error("Export 确认按钮坐标未记录！")
+                return False
+            logger.info(f"点击弹窗中的 Export（对应截图 5 中的 6）：{self.export_confirm_pos}")
+            pyautogui.click(self.export_confirm_pos[0], self.export_confirm_pos[1])
+            logger.info("等待下载完成...")
+            time.sleep(4)
+
+            # 关掉可能的提示
+            pyautogui.press("esc")
+            time.sleep(0.5)
+            pyautogui.press("esc")
+            time.sleep(0.5)
+
+            # === 六、返回 basic-search 页面，准备下一个标题 ===
+            logger.info("使用 Alt+Left 返回 basic-search 页面（替代你截图 6–9 的手动操作）...")
+            pyautogui.hotkey("alt", "left")
+            time.sleep(2)  # 等待可能出现的弹窗
+            # 多种方式关闭可能出现的各类弹窗
+            logger.info("尝试关闭可能出现的弹窗...")
+            pyautogui.press("esc")
+            time.sleep(0.3)
+            pyautogui.press("esc")
+            time.sleep(0.3)
+            pyautogui.press("enter")  # 某些弹窗需要按确定
+            time.sleep(0.3)
+            pyautogui.press("esc")
+            time.sleep(2)  # 等待页面完全返回
+
+            logger.info("清空 Title 搜索框，准备下一个标题...")
+            pyautogui.click(self.search_box_pos[0], self.search_box_pos[1])
+            time.sleep(0.5)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.2)
+            pyautogui.press("delete")
+            time.sleep(0.3)
+
+            logger.info(f"✓ 成功导出：{title}")
+            return True
+
+        except Exception as e:
+            logger.error(f"处理标题时出错：{e}")
+            return False
+
+    # ---------- 主流程 ----------
+    def run(self, start_index: int = 0, test_mode: bool = False):
+        try:
+            logger.info("=" * 60)
+            logger.info("WOS PyAutoGUI 自动化下载器（稳定版）启动")
+            logger.info("=" * 60)
+            logger.info(f"共 {len(self.titles)} 条标题")
+
+            if test_mode:
+                end_index = min(start_index + 3, len(self.titles))
+                logger.info("测试模式：仅处理前 3 条")
+            else:
+                end_index = len(self.titles)
+
+            logger.info("")
+            logger.info("使用前请确认：")
+            logger.info("1）Edge 已打开 basic-search 页面，并处于最大化或全屏状态；")
+            logger.info("2）检索条目设置为 Title；")
+            logger.info("3）不要在脚本运行期间切换分辨率或缩放。")
+            logger.info("3 秒后开始记录关键坐标...")
+
+            for i in range(3, 0, -1):
+                logger.info(f"{i} ...")
+                time.sleep(1)
+
+            # 1）记录浏览器地址栏位置
+            self.url_bar_pos = self._record_mouse_position(
+                "步骤 1a：请把鼠标移动到浏览器顶部的地址栏中央（显示https://webofscience.clarivate.cn...的位置）。"
+            )
+            
+            # 记录完地址栏后，点击页面内容区域，确保焦点离开地址栏
+            logger.info("点击页面内容区域，确保焦点离开地址栏...")
+            pyautogui.press("esc")  # 取消地址栏选中
+            time.sleep(0.3)
+            pyautogui.click(960, 540)  # 点击屏幕中央
+            time.sleep(0.5)
+
+            # 2）记录 basic-search 页面 Title 搜索框位置（对应截图 1 中中间的大输入框）
+            self.search_box_pos = self._record_mouse_position(
+                "步骤 1b：请把鼠标移动到 basic-search 页面中间的 Title 输入框中央上方（不要点击）。"
+            )
+
+            # 3）执行一次搜索，以便进入结果页，并记录复选框位置
+            first_title = self.titles[start_index]["title"]
+            logger.info("使用第一个标题执行一次搜索，用于进入结果页记录复选框位置...")
+            # 先点击搜索框确保焦点正确
+            pyautogui.click(self.search_box_pos[0], self.search_box_pos[1])
+            time.sleep(0.8)
+            pyperclip.copy(first_title)
+            time.sleep(0.2)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.2)
+            pyautogui.press("delete")
+            time.sleep(0.2)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.8)
+            pyautogui.press("enter")
+            logger.info("等待结果页加载...")
+            time.sleep(6)
+
+            # 4）记录第一个结果前复选框的坐标（对应截图 2 中的 1）
+            self.checkbox_pos = self._record_mouse_position(
+                "步骤 2：现在在结果页，请把鼠标移动到第一个结果标题前的小方框（复选框）中心位置，不要点击。"
+            )
+
+            # 为了确保 Export 按钮出现，先点一下复选框
+            logger.info("点击一次复选框，确保 Export 按钮出现...")
+            pyautogui.click(self.checkbox_pos[0], self.checkbox_pos[1])
+            time.sleep(1.5)
+
+            # 5）记录 Export 按钮坐标（对应截图 2 中的 Export 按钮）
+            self.export_pos = self._record_mouse_position(
+                "步骤 3：请把鼠标移动到 Export 按钮中央位置，不要点击（对应截图中的 Export 下拉按钮）。"
+            )
+
+            # 6）点击 Export 并选择 Tab delimited file，打开导出弹窗
+            logger.info("点击 Export 并选择 Tab delimited file...")
+            pyautogui.click(self.export_pos[0], self.export_pos[1])
+            time.sleep(1)
+            for _ in range(7):
+                pyautogui.press("down")
+                time.sleep(0.2)
+            pyautogui.press("enter")
+            logger.info("等待导出弹窗出现...")
+            time.sleep(2.5)
+
+            # 7）记录 Record Content 下拉框坐标
+            self.record_content_pos = self._record_mouse_position(
+                "步骤 4：请把鼠标移动到弹窗中 'Record Content:' 后面的下拉选择框中央，不要点击。"
+            )
+
+            # 点击下拉框,使用键盘自动选择第4个选项
+            logger.info("点击 Record Content 下拉框并自动选择 Full Record and Cited References...")
+            pyautogui.click(self.record_content_pos[0], self.record_content_pos[1])
+            time.sleep(0.8)
+            # 按3次 down 键到达第4个选项:Full Record and Cited References
+            for _ in range(3):
+                pyautogui.press("down")
+                time.sleep(0.2)
+            pyautogui.press("enter")
+            logger.info("已选择 Full Record and Cited References")
+            time.sleep(0.8)
+
+            # 8）记录弹窗中紫色 Export 按钮坐标
+            self.export_confirm_pos = self._record_mouse_position(
+                "步骤 5：请把鼠标移动到弹窗底部的紫色 'Export' 按钮中央，不要点击。"
+            )
+
+            # 9）回到 basic-search 页，之后所有标题全部由脚本自动搜索
+            logger.info("记录完坐标后，先 Alt+Left 返回 basic-search 页面...")
+            pyautogui.hotkey("alt", "left")
+            time.sleep(2)  # 等待可能出现的弹窗
+            # 多种方式关闭可能出现的各类弹窗
+            logger.info("尝试关闭可能出现的弹窗...")
+            pyautogui.press("esc")
+            time.sleep(0.3)
+            pyautogui.press("esc")
+            time.sleep(0.3)
+            pyautogui.press("enter")  # 某些弹窗需要按确定
+            time.sleep(0.3)
+            pyautogui.press("esc")
+            time.sleep(2)  # 等待页面完全返回
+
+            # 清空搜索框
+            pyautogui.click(self.search_box_pos[0], self.search_box_pos[1])
+            time.sleep(0.5)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.2)
+            pyautogui.press("delete")
+            time.sleep(0.3)
+
+            # 10）开始批量处理
+            success_count = 0
+            fail_count = 0
+
+            for idx in range(start_index, end_index):
+                title_info = self.titles[idx]
+                if self.process_one_title(title_info, is_first=(idx == start_index)):
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+                if idx < end_index - 1:
+                    logger.info("为避免触发风控，休息 5 秒...")
+                    time.sleep(5)
+
+            logger.info("=" * 60)
+            logger.info("批量下载结束")
+            logger.info(f"成功：{success_count} 条；失败：{fail_count} 条；无结果记录：{len(self.no_result_log)} 条")
+            if self.no_result_log:
+                logger.info("无结果列表已写入 no_results.log，可后续人工核查。")
+            logger.info("=" * 60)
+
+        except KeyboardInterrupt:
+            logger.info("用户中断了脚本执行。")
+        except Exception as e:
+            logger.error(f"运行过程中出现错误：{e}")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="WOS PyAutoGUI 自动化下载器（稳定版）")
+    parser.add_argument("--excel", default="user_input_files/Data test.xlsx", help="Excel 文件路径")
+    parser.add_argument("--start-index", type=int, default=0, help="起始索引（从 0 开始）")
+    parser.add_argument("--test", action="store_true", help="测试模式（仅处理前 3 条）")
+    args = parser.parse_args()
+
+    script_dir = Path(__file__).parent.absolute()
+    excel_path = script_dir / args.excel
+    if not excel_path.exists():
+        logger.error(f"Excel 文件不存在：{excel_path}")
+        return
+
+    downloader = WOSPyAutoGUIDownloader(str(excel_path))
+    downloader.run(start_index=args.start_index, test_mode=args.test)
+
+
+if __name__ == "__main__":
+    main()
